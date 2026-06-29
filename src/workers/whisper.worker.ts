@@ -13,9 +13,9 @@ async function getTranscriber() {
     self.postMessage({ type: "status", data: "Loading Whisper model..." });
     transcriber = (await pipeline(
       "automatic-speech-recognition",
-      "onnx-community/whisper-small",
+      "onnx-community/whisper-base",
       {
-        dtype: "q8",
+        dtype: "fp32",
         device: "wasm",
       }
     )) as AutomaticSpeechRecognitionPipeline;
