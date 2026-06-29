@@ -11,6 +11,35 @@ const LANGUAGE_LABELS: Record<Language, string> = {
   auto: "Auto-detect",
 };
 
+const CHUNK_DURATION = 30;
+
+function encodeWav(samples: Float32Array, sampleRate: number): Blob {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++)
+      view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
 export default function Home() {
   const [mode, setMode] = useState<TranscriptionMode>("mic");
   const [language, setLanguage] = useState<Language>("auto");
@@ -21,16 +50,15 @@ export default function Home() {
   const [fileName, setFileName] = useState("");
   const [detectedLang, setDetectedLang] = useState("");
   const [duration, setDuration] = useState<number | null>(null);
+  const [progress, setProgress] = useState(0);
 
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
+  const abortRef = useRef(false);
 
   useEffect(() => {
     return () => {
       recognitionRef.current?.stop();
-      mediaRecorderRef.current?.stop();
     };
   }, []);
 
@@ -96,32 +124,73 @@ export default function Home() {
   const transcribeFile = useCallback(
     async (file: File) => {
       setIsProcessing(true);
-      setStatus("Transcribing...");
+      setProgress(0);
+      setStatus("Decoding audio...");
       setTranscript("");
       setDetectedLang("");
       setDuration(null);
-
-      const formData = new FormData();
-      formData.append("audio", file);
-      if (language !== "auto") {
-        formData.append("language", language);
-      }
+      abortRef.current = false;
 
       try {
-        const res = await fetch("/api/transcribe", {
-          method: "POST",
-          body: formData,
-        });
+        const arrayBuffer = await file.arrayBuffer();
+        const audioCtx = new AudioContext({ sampleRate: 16000 });
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        const fullSamples = audioBuffer.getChannelData(0);
+        const sampleRate = audioBuffer.sampleRate;
+        const totalDuration = audioBuffer.duration;
+        await audioCtx.close();
 
-        if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.error || "Transcription failed");
+        const chunkSamples = CHUNK_DURATION * sampleRate;
+        const totalChunks = Math.ceil(fullSamples.length / chunkSamples);
+
+        let fullText = "";
+        let lang = "";
+
+        for (let i = 0; i < totalChunks; i++) {
+          if (abortRef.current) break;
+
+          const start = i * chunkSamples;
+          const end = Math.min(start + chunkSamples, fullSamples.length);
+          const chunk = fullSamples.slice(start, end);
+
+          setStatus(
+            `Transcribing chunk ${i + 1} of ${totalChunks}...`
+          );
+          setProgress(Math.round((i / totalChunks) * 100));
+
+          const wavBlob = encodeWav(chunk, sampleRate);
+          const formData = new FormData();
+          formData.append(
+            "audio",
+            new File([wavBlob], `chunk-${i}.wav`, { type: "audio/wav" })
+          );
+          if (language !== "auto") {
+            formData.append("language", language);
+          }
+
+          const res = await fetch("/api/transcribe", {
+            method: "POST",
+            body: formData,
+          });
+
+          if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.error || "Transcription failed");
+          }
+
+          const data = await res.json();
+          if (data.text) {
+            fullText += (fullText ? " " : "") + data.text;
+            setTranscript(fullText);
+          }
+          if (data.language && !lang) {
+            lang = data.language;
+            setDetectedLang(lang);
+          }
         }
 
-        const data = await res.json();
-        setTranscript(data.text);
-        if (data.language) setDetectedLang(data.language);
-        if (data.duration) setDuration(Math.round(data.duration));
+        setDuration(Math.round(totalDuration));
+        setProgress(100);
         setStatus("Done!");
       } catch (err) {
         setStatus(
@@ -140,6 +209,13 @@ export default function Home() {
       setFileName(file.name);
       transcribeFile(file);
     }
+  };
+
+  const cancelProcessing = () => {
+    abortRef.current = true;
+    setIsProcessing(false);
+    setStatus("Cancelled");
+    setProgress(0);
   };
 
   const copyToClipboard = () => {
@@ -284,8 +360,36 @@ export default function Home() {
           </div>
         )}
 
-        {/* Status */}
-        {status && (
+        {/* Progress Bar */}
+        {isProcessing && (
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-zinc-600 dark:text-zinc-400">
+                {status}
+              </span>
+              <div className="flex items-center gap-3">
+                <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
+                  {progress}%
+                </span>
+                <button
+                  onClick={cancelProcessing}
+                  className="rounded-md px-2 py-1 text-xs text-red-500 hover:bg-red-50 dark:hover:bg-red-950"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
+              <div
+                className="h-full rounded-full bg-zinc-900 transition-all duration-300 dark:bg-zinc-100"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Status (non-processing) */}
+        {status && !isProcessing && (
           <div
             className={`rounded-lg px-4 py-2 text-sm ${
               status.startsWith("Error")
@@ -326,7 +430,7 @@ export default function Home() {
           </div>
         )}
 
-        {transcript && (
+        {transcript && !isProcessing && (
           <button
             onClick={() => {
               setTranscript("");
@@ -334,6 +438,7 @@ export default function Home() {
               setStatus("");
               setDetectedLang("");
               setDuration(null);
+              setProgress(0);
             }}
             className="self-center rounded-md px-4 py-2 text-sm text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
           >
