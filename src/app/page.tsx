@@ -19,15 +19,18 @@ export default function Home() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [status, setStatus] = useState("");
   const [fileName, setFileName] = useState("");
+  const [detectedLang, setDetectedLang] = useState("");
+  const [duration, setDuration] = useState<number | null>(null);
 
   const recognitionRef = useRef<SpeechRecognition | null>(null);
-  const workerRef = useRef<Worker | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
 
   useEffect(() => {
     return () => {
       recognitionRef.current?.stop();
-      workerRef.current?.terminate();
+      mediaRecorderRef.current?.stop();
     };
   }, []);
 
@@ -36,9 +39,7 @@ export default function Home() {
       window.SpeechRecognition || window.webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
-      setStatus(
-        "Web Speech API not supported. Please use Chrome or Edge."
-      );
+      setStatus("Web Speech API not supported. Please use Chrome or Edge.");
       return;
     }
 
@@ -95,43 +96,40 @@ export default function Home() {
   const transcribeFile = useCallback(
     async (file: File) => {
       setIsProcessing(true);
-      setStatus("Loading Whisper model (first time may take ~1 min)...");
+      setStatus("Transcribing...");
       setTranscript("");
+      setDetectedLang("");
+      setDuration(null);
 
-      const worker = new Worker(
-        new URL("../workers/whisper.worker.ts", import.meta.url),
-        { type: "module" }
-      );
-      workerRef.current = worker;
+      const formData = new FormData();
+      formData.append("audio", file);
+      if (language !== "auto") {
+        formData.append("language", language);
+      }
 
-      worker.onmessage = (e) => {
-        const { type, data } = e.data;
-        if (type === "status") {
-          setStatus(data);
-        } else if (type === "result") {
-          setTranscript(data);
-          setStatus("Done!");
-          setIsProcessing(false);
-        } else if (type === "error") {
-          setStatus(`Error: ${data}`);
-          setIsProcessing(false);
+      try {
+        const res = await fetch("/api/transcribe", {
+          method: "POST",
+          body: formData,
+        });
+
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error || "Transcription failed");
         }
-      };
 
-      setStatus("Decoding audio...");
-      const arrayBuffer = await file.arrayBuffer();
-      const audioCtx = new AudioContext({ sampleRate: 16000 });
-      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-      const float32 = audioBuffer.getChannelData(0);
-      await audioCtx.close();
-
-      worker.postMessage(
-        {
-          audio: float32.buffer,
-          language: language === "auto" ? null : language,
-        },
-        [float32.buffer]
-      );
+        const data = await res.json();
+        setTranscript(data.text);
+        if (data.language) setDetectedLang(data.language);
+        if (data.duration) setDuration(Math.round(data.duration));
+        setStatus("Done!");
+      } catch (err) {
+        setStatus(
+          `Error: ${err instanceof Error ? err.message : "Unknown error"}`
+        );
+      } finally {
+        setIsProcessing(false);
+      }
     },
     [language]
   );
@@ -243,9 +241,7 @@ export default function Home() {
               )}
             </button>
             <p className="text-sm text-zinc-500 dark:text-zinc-400">
-              {isRecording
-                ? "Tap to stop"
-                : "Tap to start recording"}
+              {isRecording ? "Tap to stop" : "Tap to start recording"}
             </p>
           </div>
         )}
@@ -285,17 +281,18 @@ export default function Home() {
               onChange={handleFileChange}
               className="hidden"
             />
-            {isProcessing && (
-              <p className="text-sm text-zinc-500">
-                Whisper runs in your browser — no data leaves your device.
-              </p>
-            )}
           </div>
         )}
 
         {/* Status */}
         {status && (
-          <div className="rounded-lg bg-blue-50 px-4 py-2 text-sm text-blue-700 dark:bg-blue-950 dark:text-blue-300">
+          <div
+            className={`rounded-lg px-4 py-2 text-sm ${
+              status.startsWith("Error")
+                ? "bg-red-50 text-red-700 dark:bg-red-950 dark:text-red-300"
+                : "bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300"
+            }`}
+          >
             {status}
           </div>
         )}
@@ -304,9 +301,18 @@ export default function Home() {
         {transcript && (
           <div className="flex flex-col gap-2">
             <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
-                Transcript
-              </h2>
+              <div className="flex items-center gap-3">
+                <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
+                  Transcript
+                </h2>
+                {(detectedLang || duration) && (
+                  <span className="text-xs text-zinc-400">
+                    {detectedLang && `Language: ${detectedLang}`}
+                    {detectedLang && duration && " · "}
+                    {duration && `${duration}s`}
+                  </span>
+                )}
+              </div>
               <button
                 onClick={copyToClipboard}
                 className="rounded-md px-3 py-1 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
@@ -326,6 +332,8 @@ export default function Home() {
               setTranscript("");
               setFileName("");
               setStatus("");
+              setDetectedLang("");
+              setDuration(null);
             }}
             className="self-center rounded-md px-4 py-2 text-sm text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
           >
@@ -335,7 +343,7 @@ export default function Home() {
       </main>
 
       <footer className="py-4 text-center text-xs text-zinc-400 dark:text-zinc-600">
-        Powered by Whisper & Web Speech API — all processing happens locally
+        Powered by Whisper large-v3 via Groq
       </footer>
     </div>
   );
