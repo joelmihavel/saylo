@@ -24,32 +24,13 @@ async function getTranscriber() {
   return transcriber;
 }
 
-async function decodeAudio(arrayBuffer: ArrayBuffer): Promise<Float32Array> {
-  const audioContext = new OfflineAudioContext(1, 1, 16000);
-  const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-
-  const offlineCtx = new OfflineAudioContext(
-    1,
-    audioBuffer.duration * 16000,
-    16000
-  );
-  const source = offlineCtx.createBufferSource();
-  source.buffer = audioBuffer;
-  source.connect(offlineCtx.destination);
-  source.start();
-
-  const resampled = await offlineCtx.startRendering();
-  return resampled.getChannelData(0);
-}
-
 self.onmessage = async (e) => {
   try {
     const { audio, language } = e.data;
 
     const pipe = await getTranscriber();
-    self.postMessage({ type: "status", data: "Decoding audio..." });
 
-    const float32Audio = await decodeAudio(audio);
+    const float32Audio = new Float32Array(audio);
 
     self.postMessage({ type: "status", data: "Transcribing..." });
 

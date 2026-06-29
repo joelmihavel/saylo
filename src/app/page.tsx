@@ -118,11 +118,20 @@ export default function Home() {
         }
       };
 
+      setStatus("Decoding audio...");
       const arrayBuffer = await file.arrayBuffer();
-      worker.postMessage({
-        audio: arrayBuffer,
-        language: language === "auto" ? null : language,
-      });
+      const audioCtx = new AudioContext({ sampleRate: 16000 });
+      const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+      const float32 = audioBuffer.getChannelData(0);
+      await audioCtx.close();
+
+      worker.postMessage(
+        {
+          audio: float32.buffer,
+          language: language === "auto" ? null : language,
+        },
+        [float32.buffer]
+      );
     },
     [language]
   );
