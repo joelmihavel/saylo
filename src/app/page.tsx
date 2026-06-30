@@ -1,9 +1,15 @@
 "use client";
 
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback } from "react";
 
-type TranscriptionMode = "mic" | "file";
 type Language = "en" | "hi" | "auto";
+type ActiveTab = "transcript" | "summary";
+
+interface Segment {
+  start: number;
+  end: number;
+  text: string;
+}
 
 const LANGUAGE_LABELS: Record<Language, string> = {
   en: "English",
@@ -12,6 +18,12 @@ const LANGUAGE_LABELS: Record<Language, string> = {
 };
 
 const CHUNK_DURATION = 30;
+
+function formatTime(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+}
 
 function encodeWav(samples: Float32Array, sampleRate: number): Blob {
   const buffer = new ArrayBuffer(44 + samples.length * 2);
@@ -41,94 +53,28 @@ function encodeWav(samples: Float32Array, sampleRate: number): Blob {
 }
 
 export default function Home() {
-  const [mode, setMode] = useState<TranscriptionMode>("mic");
   const [language, setLanguage] = useState<Language>("auto");
-  const [isRecording, setIsRecording] = useState(false);
-  const [transcript, setTranscript] = useState("");
+  const [activeTab, setActiveTab] = useState<ActiveTab>("transcript");
   const [isProcessing, setIsProcessing] = useState(false);
   const [status, setStatus] = useState("");
   const [fileName, setFileName] = useState("");
   const [detectedLang, setDetectedLang] = useState("");
   const [duration, setDuration] = useState<number | null>(null);
   const [progress, setProgress] = useState(0);
+  const [segments, setSegments] = useState<Segment[]>([]);
 
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef(false);
-
-  useEffect(() => {
-    return () => {
-      recognitionRef.current?.stop();
-    };
-  }, []);
-
-  const startMicRecording = useCallback(() => {
-    const SpeechRecognition =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-      setStatus("Web Speech API not supported. Please use Chrome or Edge.");
-      return;
-    }
-
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-
-    if (language === "hi") {
-      recognition.lang = "hi-IN";
-    } else if (language === "en") {
-      recognition.lang = "en-US";
-    } else {
-      recognition.lang = "hi-IN";
-    }
-
-    let finalTranscript = transcript;
-
-    recognition.onresult = (event) => {
-      let interim = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const result = event.results[i];
-        if (result.isFinal) {
-          finalTranscript += result[0].transcript + " ";
-        } else {
-          interim += result[0].transcript;
-        }
-      }
-      setTranscript(finalTranscript + interim);
-    };
-
-    recognition.onerror = (event) => {
-      if (event.error !== "aborted") {
-        setStatus(`Mic error: ${event.error}`);
-      }
-      setIsRecording(false);
-    };
-
-    recognition.onend = () => {
-      setIsRecording(false);
-    };
-
-    recognitionRef.current = recognition;
-    recognition.start();
-    setIsRecording(true);
-    setStatus("Listening...");
-  }, [language, transcript]);
-
-  const stopMicRecording = useCallback(() => {
-    recognitionRef.current?.stop();
-    setIsRecording(false);
-    setStatus("");
-  }, []);
 
   const transcribeFile = useCallback(
     async (file: File) => {
       setIsProcessing(true);
       setProgress(0);
       setStatus("Decoding audio...");
-      setTranscript("");
+      setSegments([]);
       setDetectedLang("");
       setDuration(null);
+      setActiveTab("transcript");
       abortRef.current = false;
 
       try {
@@ -143,7 +89,7 @@ export default function Home() {
         const chunkSamples = CHUNK_DURATION * sampleRate;
         const totalChunks = Math.ceil(fullSamples.length / chunkSamples);
 
-        let fullText = "";
+        let allSegments: Segment[] = [];
         let lang = "";
 
         for (let i = 0; i < totalChunks; i++) {
@@ -152,10 +98,9 @@ export default function Home() {
           const start = i * chunkSamples;
           const end = Math.min(start + chunkSamples, fullSamples.length);
           const chunk = fullSamples.slice(start, end);
+          const chunkOffset = i * CHUNK_DURATION;
 
-          setStatus(
-            `Transcribing chunk ${i + 1} of ${totalChunks}...`
-          );
+          setStatus(`Transcribing ${i + 1} of ${totalChunks}...`);
           setProgress(Math.round((i / totalChunks) * 100));
 
           const wavBlob = encodeWav(chunk, sampleRate);
@@ -164,6 +109,7 @@ export default function Home() {
             "audio",
             new File([wavBlob], `chunk-${i}.wav`, { type: "audio/wav" })
           );
+          formData.append("chunkOffset", chunkOffset.toString());
           if (language !== "auto") {
             formData.append("language", language);
           }
@@ -179,9 +125,9 @@ export default function Home() {
           }
 
           const data = await res.json();
-          if (data.text) {
-            fullText += (fullText ? " " : "") + data.text;
-            setTranscript(fullText);
+          if (data.segments?.length) {
+            allSegments = [...allSegments, ...data.segments];
+            setSegments(allSegments);
           }
           if (data.language && !lang) {
             lang = data.language;
@@ -191,7 +137,7 @@ export default function Home() {
 
         setDuration(Math.round(totalDuration));
         setProgress(100);
-        setStatus("Done!");
+        setStatus("");
       } catch (err) {
         setStatus(
           `Error: ${err instanceof Error ? err.message : "Unknown error"}`
@@ -218,15 +164,32 @@ export default function Home() {
     setProgress(0);
   };
 
+  const fullText = segments.map((s) => s.text).join(" ");
+
   const copyToClipboard = () => {
-    navigator.clipboard.writeText(transcript);
+    const formatted = segments
+      .map((s) => `[${formatTime(s.start)}] ${s.text}`)
+      .join("\n");
+    navigator.clipboard.writeText(formatted);
     setStatus("Copied to clipboard!");
     setTimeout(() => setStatus(""), 2000);
   };
 
+  const clearAll = () => {
+    setSegments([]);
+    setFileName("");
+    setStatus("");
+    setDetectedLang("");
+    setDuration(null);
+    setProgress(0);
+  };
+
+  const hasResult = segments.length > 0;
+
   return (
     <div className="flex flex-col flex-1 items-center bg-zinc-50 font-sans dark:bg-zinc-950">
       <main className="flex flex-1 w-full max-w-2xl flex-col gap-6 py-12 px-6">
+        {/* Header */}
         <div className="text-center">
           <h1 className="text-3xl font-bold tracking-tight text-zinc-900 dark:text-zinc-50">
             Saylo
@@ -236,42 +199,13 @@ export default function Home() {
           </p>
         </div>
 
-        {/* Mode Tabs */}
-        <div className="flex rounded-lg bg-zinc-100 p-1 dark:bg-zinc-800">
-          <button
-            onClick={() => {
-              setMode("mic");
-              stopMicRecording();
-            }}
-            className={`flex-1 rounded-md py-2 text-sm font-medium transition-colors ${
-              mode === "mic"
-                ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-700 dark:text-zinc-50"
-                : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400"
-            }`}
-          >
-            Microphone
-          </button>
-          <button
-            onClick={() => {
-              setMode("file");
-              stopMicRecording();
-            }}
-            className={`flex-1 rounded-md py-2 text-sm font-medium transition-colors ${
-              mode === "file"
-                ? "bg-white text-zinc-900 shadow-sm dark:bg-zinc-700 dark:text-zinc-50"
-                : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400"
-            }`}
-          >
-            Upload File
-          </button>
-        </div>
-
         {/* Language Selector */}
-        <div className="flex gap-2">
+        <div className="flex gap-2 justify-center">
           {(Object.keys(LANGUAGE_LABELS) as Language[]).map((lang) => (
             <button
               key={lang}
               onClick={() => setLanguage(lang)}
+              disabled={isProcessing}
               className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
                 language === lang
                   ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
@@ -283,82 +217,41 @@ export default function Home() {
           ))}
         </div>
 
-        {/* Mic Mode */}
-        {mode === "mic" && (
-          <div className="flex flex-col items-center gap-4">
-            <button
-              onClick={isRecording ? stopMicRecording : startMicRecording}
-              className={`relative flex h-20 w-20 items-center justify-center rounded-full transition-colors ${
-                isRecording
-                  ? "bg-red-500 hover:bg-red-600"
-                  : "bg-zinc-900 hover:bg-zinc-700 dark:bg-zinc-100 dark:hover:bg-zinc-300"
-              }`}
+        {/* Upload Area */}
+        <div className="flex flex-col items-center gap-4">
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isProcessing}
+            className="flex w-full flex-col items-center gap-2 rounded-xl border-2 border-dashed border-zinc-300 p-8 transition-colors hover:border-zinc-400 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:hover:border-zinc-600 dark:hover:bg-zinc-800/50"
+          >
+            <svg
+              className="h-10 w-10 text-zinc-400"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
             >
-              {isRecording && (
-                <span className="absolute inset-0 rounded-full bg-red-400 animate-pulse-ring" />
-              )}
-              {isRecording ? (
-                <svg
-                  className="h-8 w-8 text-white"
-                  fill="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <rect x="6" y="6" width="12" height="12" rx="2" />
-                </svg>
-              ) : (
-                <svg
-                  className="h-8 w-8 text-white dark:text-zinc-900"
-                  fill="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
-                  <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
-                </svg>
-              )}
-            </button>
-            <p className="text-sm text-zinc-500 dark:text-zinc-400">
-              {isRecording ? "Tap to stop" : "Tap to start recording"}
-            </p>
-          </div>
-        )}
-
-        {/* File Mode */}
-        {mode === "file" && (
-          <div className="flex flex-col items-center gap-4">
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              disabled={isProcessing}
-              className="flex w-full flex-col items-center gap-2 rounded-xl border-2 border-dashed border-zinc-300 p-8 transition-colors hover:border-zinc-400 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:hover:border-zinc-600 dark:hover:bg-zinc-800/50"
-            >
-              <svg
-                className="h-10 w-10 text-zinc-400"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={1.5}
-                  d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
-                />
-              </svg>
-              <span className="text-sm font-medium text-zinc-600 dark:text-zinc-400">
-                {fileName || "Choose an audio file"}
-              </span>
-              <span className="text-xs text-zinc-400">
-                MP3, WAV, M4A, WEBM, OGG
-              </span>
-            </button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="audio/*"
-              onChange={handleFileChange}
-              className="hidden"
-            />
-          </div>
-        )}
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={1.5}
+                d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
+              />
+            </svg>
+            <span className="text-sm font-medium text-zinc-600 dark:text-zinc-400">
+              {fileName || "Choose an audio file"}
+            </span>
+            <span className="text-xs text-zinc-400">
+              MP3, WAV, M4A, WEBM, OGG
+            </span>
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="audio/*"
+            onChange={handleFileChange}
+            className="hidden"
+          />
+        </div>
 
         {/* Progress Bar */}
         {isProcessing && (
@@ -401,49 +294,101 @@ export default function Home() {
           </div>
         )}
 
-        {/* Transcript */}
-        {transcript && (
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">
-                  Transcript
-                </h2>
-                {(detectedLang || duration) && (
-                  <span className="text-xs text-zinc-400">
-                    {detectedLang && `Language: ${detectedLang}`}
-                    {detectedLang && duration && " · "}
-                    {duration && `${duration}s`}
-                  </span>
-                )}
-              </div>
+        {/* Results Tabs */}
+        {hasResult && (
+          <>
+            <div className="flex border-b border-zinc-200 dark:border-zinc-800">
               <button
-                onClick={copyToClipboard}
-                className="rounded-md px-3 py-1 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                onClick={() => setActiveTab("transcript")}
+                className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
+                  activeTab === "transcript"
+                    ? "border-zinc-900 text-zinc-900 dark:border-zinc-100 dark:text-zinc-100"
+                    : "border-transparent text-zinc-500 hover:text-zinc-700 dark:text-zinc-400"
+                }`}
               >
-                Copy
+                Transcript
+              </button>
+              <button
+                onClick={() => setActiveTab("summary")}
+                className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
+                  activeTab === "summary"
+                    ? "border-zinc-900 text-zinc-900 dark:border-zinc-100 dark:text-zinc-100"
+                    : "border-transparent text-zinc-500 hover:text-zinc-700 dark:text-zinc-400"
+                }`}
+              >
+                AI Summary
               </button>
             </div>
-            <div className="min-h-[120px] rounded-xl bg-white p-4 text-sm leading-relaxed text-zinc-800 shadow-sm ring-1 ring-zinc-200 dark:bg-zinc-900 dark:text-zinc-200 dark:ring-zinc-800">
-              {transcript}
-            </div>
-          </div>
-        )}
 
-        {transcript && !isProcessing && (
-          <button
-            onClick={() => {
-              setTranscript("");
-              setFileName("");
-              setStatus("");
-              setDetectedLang("");
-              setDuration(null);
-              setProgress(0);
-            }}
-            className="self-center rounded-md px-4 py-2 text-sm text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
-          >
-            Clear
-          </button>
+            {/* Transcript Tab */}
+            {activeTab === "transcript" && (
+              <div className="flex flex-col gap-3">
+                {/* Meta + Copy */}
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-zinc-400">
+                    {detectedLang && `Language: ${detectedLang}`}
+                    {detectedLang && duration ? " · " : ""}
+                    {duration && `Duration: ${formatTime(duration)}`}
+                  </span>
+                  <button
+                    onClick={copyToClipboard}
+                    className="rounded-md px-3 py-1 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
+                  >
+                    Copy
+                  </button>
+                </div>
+
+                {/* Segments */}
+                <div className="flex flex-col gap-1 rounded-xl bg-white p-2 shadow-sm ring-1 ring-zinc-200 dark:bg-zinc-900 dark:ring-zinc-800">
+                  {segments.map((seg, i) => (
+                    <div
+                      key={i}
+                      className="group flex gap-3 rounded-lg px-3 py-2.5 transition-colors hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
+                    >
+                      <span className="shrink-0 pt-0.5 text-xs font-mono text-zinc-400 dark:text-zinc-500 tabular-nums">
+                        {formatTime(seg.start)}
+                      </span>
+                      <p className="text-sm leading-relaxed text-zinc-800 dark:text-zinc-200">
+                        {seg.text}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Summary Tab — Placeholder */}
+            {activeTab === "summary" && (
+              <div className="flex flex-col items-center gap-3 rounded-xl bg-white p-8 shadow-sm ring-1 ring-zinc-200 dark:bg-zinc-900 dark:ring-zinc-800">
+                <svg
+                  className="h-10 w-10 text-zinc-300 dark:text-zinc-600"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={1.5}
+                    d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z"
+                  />
+                </svg>
+                <p className="text-sm text-zinc-500 dark:text-zinc-400 text-center">
+                  AI-powered summary coming soon
+                </p>
+              </div>
+            )}
+
+            {/* Clear */}
+            {!isProcessing && (
+              <button
+                onClick={clearAll}
+                className="self-center rounded-md px-4 py-2 text-sm text-zinc-500 transition-colors hover:bg-zinc-100 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
+              >
+                Clear
+              </button>
+            )}
+          </>
         )}
       </main>
 
