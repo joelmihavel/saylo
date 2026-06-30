@@ -11,6 +11,14 @@ interface Segment {
   text: string;
 }
 
+interface Summary {
+  overview: string;
+  keyPoints: string[];
+  topics: { name: string; detail: string }[];
+  actionItems: string[];
+  sentiment: string;
+}
+
 const LANGUAGE_LABELS: Record<Language, string> = {
   en: "English",
   hi: "Hindi / Hinglish",
@@ -62,9 +70,35 @@ export default function Home() {
   const [duration, setDuration] = useState<number | null>(null);
   const [progress, setProgress] = useState(0);
   const [segments, setSegments] = useState<Segment[]>([]);
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [isSummarizing, setIsSummarizing] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef(false);
+
+  const generateSummary = useCallback(async (segs: Segment[]) => {
+    setIsSummarizing(true);
+    try {
+      const transcript = segs.map((s) => s.text).join(" ");
+      const res = await fetch("/api/summarize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transcript }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || "Summary failed");
+      }
+      const data = await res.json();
+      setSummary(data);
+    } catch (err) {
+      setStatus(
+        `Summary error: ${err instanceof Error ? err.message : "Unknown error"}`
+      );
+    } finally {
+      setIsSummarizing(false);
+    }
+  }, []);
 
   const transcribeFile = useCallback(
     async (file: File) => {
@@ -72,6 +106,7 @@ export default function Home() {
       setProgress(0);
       setStatus("Decoding audio...");
       setSegments([]);
+      setSummary(null);
       setDetectedLang("");
       setDuration(null);
       setActiveTab("transcript");
@@ -138,6 +173,10 @@ export default function Home() {
         setDuration(Math.round(totalDuration));
         setProgress(100);
         setStatus("");
+
+        if (allSegments.length > 0) {
+          generateSummary(allSegments);
+        }
       } catch (err) {
         setStatus(
           `Error: ${err instanceof Error ? err.message : "Unknown error"}`
@@ -146,7 +185,7 @@ export default function Home() {
         setIsProcessing(false);
       }
     },
-    [language]
+    [language, generateSummary]
   );
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -164,8 +203,6 @@ export default function Home() {
     setProgress(0);
   };
 
-  const fullText = segments.map((s) => s.text).join(" ");
-
   const copyToClipboard = () => {
     const formatted = segments
       .map((s) => `[${formatTime(s.start)}] ${s.text}`)
@@ -177,6 +214,7 @@ export default function Home() {
 
   const clearAll = () => {
     setSegments([]);
+    setSummary(null);
     setFileName("");
     setStatus("");
     setDetectedLang("");
@@ -285,7 +323,7 @@ export default function Home() {
         {status && !isProcessing && (
           <div
             className={`rounded-lg px-4 py-2 text-sm ${
-              status.startsWith("Error")
+              status.startsWith("Error") || status.startsWith("Summary error")
                 ? "bg-red-50 text-red-700 dark:bg-red-950 dark:text-red-300"
                 : "bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300"
             }`}
@@ -310,20 +348,22 @@ export default function Home() {
               </button>
               <button
                 onClick={() => setActiveTab("summary")}
-                className={`px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
+                className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium transition-colors border-b-2 -mb-px ${
                   activeTab === "summary"
                     ? "border-zinc-900 text-zinc-900 dark:border-zinc-100 dark:text-zinc-100"
                     : "border-transparent text-zinc-500 hover:text-zinc-700 dark:text-zinc-400"
                 }`}
               >
                 AI Summary
+                {isSummarizing && (
+                  <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-zinc-300 border-t-zinc-600 dark:border-zinc-600 dark:border-t-zinc-300" />
+                )}
               </button>
             </div>
 
             {/* Transcript Tab */}
             {activeTab === "transcript" && (
               <div className="flex flex-col gap-3">
-                {/* Meta + Copy */}
                 <div className="flex items-center justify-between">
                   <span className="text-xs text-zinc-400">
                     {detectedLang && `Language: ${detectedLang}`}
@@ -338,7 +378,6 @@ export default function Home() {
                   </button>
                 </div>
 
-                {/* Segments */}
                 <div className="flex flex-col gap-1 rounded-xl bg-white p-2 shadow-sm ring-1 ring-zinc-200 dark:bg-zinc-900 dark:ring-zinc-800">
                   {segments.map((seg, i) => (
                     <div
@@ -357,25 +396,97 @@ export default function Home() {
               </div>
             )}
 
-            {/* Summary Tab — Placeholder */}
+            {/* Summary Tab */}
             {activeTab === "summary" && (
-              <div className="flex flex-col items-center gap-3 rounded-xl bg-white p-8 shadow-sm ring-1 ring-zinc-200 dark:bg-zinc-900 dark:ring-zinc-800">
-                <svg
-                  className="h-10 w-10 text-zinc-300 dark:text-zinc-600"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={1.5}
-                    d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456zM16.894 20.567L16.5 21.75l-.394-1.183a2.25 2.25 0 00-1.423-1.423L13.5 18.75l1.183-.394a2.25 2.25 0 001.423-1.423l.394-1.183.394 1.183a2.25 2.25 0 001.423 1.423l1.183.394-1.183.394a2.25 2.25 0 00-1.423 1.423z"
-                  />
-                </svg>
-                <p className="text-sm text-zinc-500 dark:text-zinc-400 text-center">
-                  AI-powered summary coming soon
-                </p>
+              <div className="flex flex-col gap-4">
+                {isSummarizing && (
+                  <div className="flex flex-col items-center gap-3 rounded-xl bg-white p-8 shadow-sm ring-1 ring-zinc-200 dark:bg-zinc-900 dark:ring-zinc-800">
+                    <span className="inline-block h-6 w-6 animate-spin rounded-full border-2 border-zinc-300 border-t-zinc-600 dark:border-zinc-600 dark:border-t-zinc-300" />
+                    <p className="text-sm text-zinc-500 dark:text-zinc-400">
+                      Generating summary...
+                    </p>
+                  </div>
+                )}
+
+                {summary && (
+                  <>
+                    {/* Overview */}
+                    <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-zinc-200 dark:bg-zinc-900 dark:ring-zinc-800">
+                      <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+                        Overview
+                      </h3>
+                      <p className="mt-2 text-sm leading-relaxed text-zinc-800 dark:text-zinc-200">
+                        {summary.overview}
+                      </p>
+                      {summary.sentiment && (
+                        <span className="mt-3 inline-block rounded-full bg-zinc-100 px-2.5 py-0.5 text-xs font-medium text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400">
+                          {summary.sentiment}
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Key Points */}
+                    {summary.keyPoints?.length > 0 && (
+                      <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-zinc-200 dark:bg-zinc-900 dark:ring-zinc-800">
+                        <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+                          Key Points
+                        </h3>
+                        <ul className="mt-3 flex flex-col gap-2">
+                          {summary.keyPoints.map((point, i) => (
+                            <li key={i} className="flex gap-2 text-sm">
+                              <span className="shrink-0 mt-1 h-1.5 w-1.5 rounded-full bg-zinc-400 dark:bg-zinc-500" />
+                              <span className="text-zinc-800 dark:text-zinc-200">
+                                {point}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    {/* Topics */}
+                    {summary.topics?.length > 0 && (
+                      <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-zinc-200 dark:bg-zinc-900 dark:ring-zinc-800">
+                        <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+                          Topics Discussed
+                        </h3>
+                        <div className="mt-3 flex flex-col gap-3">
+                          {summary.topics.map((topic, i) => (
+                            <div key={i}>
+                              <span className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
+                                {topic.name}
+                              </span>
+                              <p className="mt-0.5 text-sm text-zinc-500 dark:text-zinc-400">
+                                {topic.detail}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Action Items */}
+                    {summary.actionItems?.length > 0 && (
+                      <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-zinc-200 dark:bg-zinc-900 dark:ring-zinc-800">
+                        <h3 className="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
+                          Action Items
+                        </h3>
+                        <ul className="mt-3 flex flex-col gap-2">
+                          {summary.actionItems.map((item, i) => (
+                            <li key={i} className="flex gap-2 text-sm">
+                              <span className="shrink-0 text-zinc-400">
+                                &#9744;
+                              </span>
+                              <span className="text-zinc-800 dark:text-zinc-200">
+                                {item}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
             )}
 
@@ -393,7 +504,7 @@ export default function Home() {
       </main>
 
       <footer className="py-4 text-center text-xs text-zinc-400 dark:text-zinc-600">
-        Powered by Whisper large-v3 via Groq
+        Powered by Whisper large-v3 via Groq · Gemini Flash
       </footer>
     </div>
   );
